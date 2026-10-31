@@ -17,6 +17,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -24,6 +25,11 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.linear.kda_head_shard import (
+    KDAHeadShard,
+    is_kda_decode_head_split,
+)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -33,7 +39,12 @@ from sglang.srt.layers.communicator import (
     layer_input_buffer,
     reduce_output,
 )
+from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.srt.layers.communicator_mhc_hybrid_cp import (
+    MHCHybridDSACPLayerCommunicator,
+)
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -85,6 +96,9 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
+)
+from sglang.srt.models.deepseek_common.mla_decode_head_view import (
+    attach_mla_decode_head_view,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
@@ -585,6 +599,89 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+        # Built after weight loading by build_decode_head_shard, when decode splits heads
+        self.attn_head_shard: Optional[RadixLinearAttention] = None
+
+    def build_decode_head_shard(self) -> None:
+        """Slice this rank's decode heads out of the full weights prefill CP holds."""
+        if not is_kda_decode_head_split():
+            return
+        if not self.do_fuse_qkvbfg:
+            raise NotImplementedError(
+                "KDA decode head split needs the fused bf16 projections, which "
+                "LoRA or this quantization disables; disable LoRA, use an "
+                "unquantized checkpoint, or drop --enable-prefill-cp"
+            )
+        parallel = get_parallel()
+        num_local_heads = self.num_heads // parallel.attn_cp_size
+        head_start = parallel.attn_cp_rank * num_local_heads
+        projection_size = self.num_heads * self.head_dim
+        local_dim = num_local_heads * self.head_dim
+        rows = slice(head_start * self.head_dim, head_start * self.head_dim + local_dim)
+
+        q_w, k_w, v_w, b_w, fg_a_w = self.fused_qkvbfg_a_proj.weight.split(
+            [
+                projection_size,
+                projection_size,
+                projection_size,
+                self.num_heads,
+                2 * self.head_dim,
+            ]
+        )
+        self._decode_qkvbfg_a_weight = torch.cat(
+            [
+                q_w[rows],
+                k_w[rows],
+                v_w[rows],
+                b_w[head_start : head_start + num_local_heads],
+                fg_a_w,
+            ]
+        ).contiguous()
+        self._decode_split_sizes = [3 * local_dim, num_local_heads, 2 * self.head_dim]
+        # [2, local_dim, head_dim]: the forget and output gates' up-projections
+        self._decode_fg_b_weight = self.fused_fg_b_proj.weight[:, rows].contiguous()
+        # [hidden, local_dim]: this rank's heads' share of the output projection
+        self._decode_o_weight = self.o_proj.weight[:, rows].contiguous()
+        self.attn_head_shard = RadixLinearAttention(
+            layer_id=self.layer_idx,
+            num_q_heads=num_local_heads,
+            num_k_heads=num_local_heads,
+            num_v_heads=num_local_heads,
+            head_q_dim=self.head_k_dim,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            conv_weights=self.attn.conv_weights,
+            bias=self.attn.bias,
+            A_log=self.A_log.view(-1)[head_start : head_start + num_local_heads],
+            dt_bias=self.dt_bias[rows],
+            lower_bound=self.attn.lower_bound,
+            decode_head_shard=KDAHeadShard(
+                head_start=head_start, segment_dim=projection_size
+            ),
+        )
+
+    def _forward_decode_head_shard(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        fused_states = F.linear(hidden_states, self._decode_qkvbfg_a_weight)
+        mixed_qkv, beta, fg_a_states = torch.split(
+            fused_states, self._decode_split_sizes, dim=-1
+        )
+        forget_gate, g_proj_states = torch.bmm(
+            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1),
+            self._decode_fg_b_weight.transpose(-1, -2),
+        )
+        core_attn_out = self.attn_head_shard(
+            forward_batch, mixed_qkv=mixed_qkv, a=forget_gate, b=beta.unsqueeze(0)
+        )
+        core_attn_out = self.o_norm(
+            core_attn_out, g_proj_states.unflatten(-1, (-1, self.head_dim))
+        )
+        core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+        # Each rank holds its heads' partial sum; attention TP 1 does no reduction after
+        return tensor_model_parallel_all_reduce(
+            F.linear(core_attn_out, self._decode_o_weight)
+        )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -633,6 +730,8 @@ class Glm5NextLinearAttention(nn.Module):
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             return hidden_states
+        if self.attn_head_shard is not None and forward_batch.forward_mode.is_decode():
+            return self._forward_decode_head_shard(hidden_states, forward_batch)
 
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
@@ -793,6 +892,10 @@ class Glm5NextDecoderLayer(nn.Module):
             ),
         )
 
+        # Under prefill CP each rank keeps its own tokens through the layer and
+        # gathers only around the full-TP MLP; the KDA layers carry their state
+        # across ranks in the linear-attention backend
+        prefill_cp = is_dsa_enable_prefill_cp()
         if self.config.mhc:
             mhc_kwargs: Dict[str, Any] = dict(
                 is_first_layer=(self.layer_id == 0),
@@ -808,10 +911,15 @@ class Glm5NextDecoderLayer(nn.Module):
                     else None
                 ),
             )
-            self.layer_communicator = MHCLayerCommunicator(
+            communicator_class = (
+                MHCHybridDSACPLayerCommunicator if prefill_cp else MHCLayerCommunicator
+            )
+            self.layer_communicator = communicator_class(
                 **shared_kwargs,
                 **mhc_kwargs,
             )
+        elif prefill_cp:
+            self.layer_communicator = DSACPLayerCommunicator(**shared_kwargs)
         else:
             self.layer_communicator = LayerCommunicator(**shared_kwargs)
 
@@ -1404,6 +1512,34 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # Capturing before layer k + 1 gives the completed output of layer k.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        return prepare_decode_context_parallel_metadata(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_buffer_shape=kv_buffer_shape,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+        )
+
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -1745,6 +1881,33 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
+        if not is_nextn and self.model is not None:
+            kda_layers = [
+                layer.self_attn
+                for layer in self.model.layers
+                if isinstance(layer, Glm5NextDecoderLayer)
+                and isinstance(layer.self_attn, Glm5NextLinearAttention)
+            ]
+            for kda_layer in kda_layers:
+                kda_layer.build_decode_head_shard()
+            if kda_layers and kda_layers[0].attn_head_shard is not None:
+                logger.info(
+                    "KDA decode splits heads over the prefill-CP group: %d layers",
+                    len(kda_layers),
+                )
+            mla_layers = [
+                layer.self_attn
+                for layer in self.model.layers
+                if isinstance(layer, Glm5NextDecoderLayer)
+                and isinstance(layer.self_attn, DeepseekV2AttentionMLA)
+            ]
+            for mla_layer in mla_layers:
+                mla_layer.decode_head_view = attach_mla_decode_head_view(mla_layer)
+            if mla_layers and mla_layers[0].decode_head_view is not None:
+                logger.info(
+                    "MLA decode splits heads over the prefill-CP group: %d layers",
+                    len(mla_layers),
+                )
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:

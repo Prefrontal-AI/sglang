@@ -123,6 +123,35 @@ def cp_lse_ag_out_rs_mla(
     return out.to(cp_attn_out.dtype)
 
 
+def cp_lse_ag_out_ar_mla(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    is_lse_base_on_e: bool = False,
+):
+    """cp_lse_ag_out_rs_mla for ranks that all computed every head: [B, H, D] -> [H, B, D].
+
+    The corrected partials are all-reduced, so every rank keeps all heads.
+    """
+    if cp_group.world_size == 1:
+        return cp_attn_out.transpose(0, 1)
+
+    new_output = cp_attn_out.new_empty(
+        cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
+    )
+    lses = _ag_lse(cp_attn_lse.to(torch.float32), cp_group)
+    out, _ = correct_attn_out(
+        cp_attn_out,
+        lses,
+        cp_group.rank_in_group,
+        CPTritonContext(),
+        new_output,
+        is_lse_base_on_e=is_lse_base_on_e,
+    )
+    out = cp_group.all_reduce(out)
+    return out.to(cp_attn_out.dtype)
+
+
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     parallel = get_parallel()
     dcp_world_size = parallel.dcp_size
@@ -152,8 +181,12 @@ def all_gather_kv_cache_for_mha_chunk_extend(
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
 ):
+    # A latent with no rope part (qk_rope_head_dim 0, as GLM-5.3-Flash's) reads back k_pe None
+    no_rope = k_pe is None
     if get_parallel().dcp_enabled:
         kv_a = kv_a.unsqueeze(1)
+        if no_rope:
+            k_pe = kv_a[..., :0]
         gathered_kv = all_gather_kv_cache_for_dcp(
             kv_a,
             k_pe,
@@ -162,6 +195,8 @@ def all_gather_kv_cache_for_mha_chunk_extend(
         )
         kv_a, k_pe = gathered_kv.split([kv_a.shape[-1], k_pe.shape[-1]], dim=-1)
         kv_a = kv_a.squeeze(1)
+    if no_rope:
+        return kv_a.contiguous(), None
     return kv_a.contiguous(), k_pe.contiguous()
 
 
@@ -179,6 +214,8 @@ def all_gather_kv_cache_for_mha_extend(
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
         attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
     )
+    if prefix_k_pe is None:
+        prefix_k_pe = prefix_kv_a[..., :0]
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
@@ -254,6 +291,8 @@ def all_gather_kv_cache_for_mla_extend(
             attn_mqa,
             dcp_local_prefix_kv_indices,
         )
+        if cache_k_rope is None:
+            cache_k_rope = cache_k_nope[..., :0]
         extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
         # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
         gathered_kv = all_gather_kv_cache_for_dcp(

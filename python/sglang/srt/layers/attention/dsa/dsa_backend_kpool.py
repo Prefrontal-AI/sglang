@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -27,6 +27,11 @@ if TYPE_CHECKING:
 class _KPoolForwardInputs:
     full_real_page_table: Optional[torch.Tensor] = None
     full_seqlens_expanded: Optional[torch.Tensor] = None
+    # Under contiguous CP: this rank's query rows for the top-k, while the
+    # pool writes stay over the whole gathered batch
+    local_seqlens_expanded: Optional[torch.Tensor] = None
+    local_extend_seq_lens_cpu: Optional[List[int]] = None
+    local_seq_lens_cpu: Optional[List[int]] = None
 
 
 class DeepseekSparseAttnBackendKPoolMixin:
@@ -50,6 +55,19 @@ class DeepseekSparseAttnBackendKPoolMixin:
             "backend."
         )
 
+    def _refuse_trtllm_under_dcp(self, dsa_impl: _DSA_IMPL_T) -> None:
+        # The trtllm sparse MLA prefill reads the rank's own KV pool with the global
+        # slots of the selection: it returns before the DCP gather that maps them to
+        # the gathered rows, so under DCP it would read wrong rows silently, and past
+        # the rank's pool size out of bounds.
+        if dsa_impl == "trtllm" and getattr(self, "dcp_size", 1) > 1:
+            raise NotImplementedError(
+                "The trtllm DSA prefill does not read through the decode context "
+                "parallel gather - under --dcp-size > 1 pass --dsa-prefill-backend "
+                "tilelang (on Blackwell, flashmla_sparse with pooled index keys "
+                "resolves to trtllm)."
+            )
+
     def _resolve_kpool_tail_backend(
         self,
         topk_indices: Optional[torch.Tensor],
@@ -68,7 +86,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
         return dsa_impl
 
     def _kpool_slots_per_page(self) -> int:
-        return getattr(self.token_to_kv_pool, "slots_per_page", self.real_page_size)
+        return self.token_to_kv_pool.index_kernel_page_size
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
         if self.device_sm_major == 9:
@@ -100,6 +118,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 topk_transform_method=topk_transform_method,
                 full_real_page_table=kpool_inputs.full_real_page_table,
                 full_seqlens_expanded=kpool_inputs.full_seqlens_expanded,
+                local_seqlens_expanded=kpool_inputs.local_seqlens_expanded,
+                local_extend_seq_lens_cpu=kpool_inputs.local_extend_seq_lens_cpu,
+                local_seq_lens_cpu=kpool_inputs.local_seq_lens_cpu,
             )
 
         if forward_mode.is_decode_or_idle():

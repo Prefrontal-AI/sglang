@@ -48,6 +48,8 @@ if is_npu():
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.cp.base import ContextParallelStrategyKind, get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -422,7 +424,7 @@ class IndexerKPool(MultiPlatformOp):
                         max_req = int(active_req.max().item())
                         min_loc = int(active_write_loc.min().item())
                         max_loc = int(active_write_loc.max().item())
-                        max_page = max_loc // int(pool.slots_per_page)
+                        max_page = max_loc // int(pool.index_kernel_page_size)
                         if (
                             min_chunk < 0
                             or max_chunk >= key.shape[0]
@@ -440,7 +442,7 @@ class IndexerKPool(MultiPlatformOp):
                                 f"{key.shape=}, {gate_score.shape=}, {tail_k_buf.shape=}, "
                                 f"{pool.get_index_k_with_scale_buffer(layer_id=layer_id).shape=}, "
                                 f"{min_chunk=}, {max_chunk=}, {min_req=}, {max_req=}, "
-                                f"{min_loc=}, {max_loc=}, {pool.slots_per_page=}"
+                                f"{min_loc=}, {max_loc=}, {pool.index_kernel_page_size=}"
                             )
                 if not tails.is_empty:
                     tail_chunk_max = tails.chunk_src.to(torch.long) + torch.clamp(
@@ -632,6 +634,38 @@ class IndexerKPool(MultiPlatformOp):
                 "index_kpool_compress currently supports decode and extend only."
             )
         return None
+
+    @staticmethod
+    def _is_prefill_cp_active(forward_batch: ForwardBatch) -> bool:
+        if not dsa_use_prefill_cp(forward_batch) or not is_cp_active(forward_batch):
+            return False
+        if get_cp_strategy().kind != ContextParallelStrategyKind.CONTIGUOUS:
+            # The KPool plan localizes its top-k rows only for contiguous spans
+            raise NotImplementedError(
+                "KPool DSA prefill context parallelism requires --cp-strategy contiguous"
+            )
+        return True
+
+    def _gather_key_and_gate_score(
+        self,
+        x: torch.Tensor,
+        key: torch.Tensor,
+        gate_score: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather this rank's index keys and pool gate scores to the whole sequence.
+
+        Every rank then writes every pool of the sequence, so each holds the
+        complete index cache its local queries score against.
+        """
+        gate_score = self._compute_gate_score_if_missing(x, gate_score)
+        # One collective for both: [tokens, head_dim + gate_dim], full order after
+        packed = torch.cat([key, gate_score.to(key.dtype)], dim=-1).contiguous()
+        packed = get_cp_strategy().gather_kv_cache(packed, forward_batch)
+        key_full, gate_full = torch.split(
+            packed, [key.shape[-1], gate_score.shape[-1]], dim=-1
+        )
+        return key_full.contiguous(), gate_full.to(gate_score.dtype).contiguous()
 
     def _compute_gate_score_if_missing(
         self, x: torch.Tensor, gate_score: Optional[torch.Tensor]
@@ -955,7 +989,7 @@ class IndexerKPool(MultiPlatformOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.index_kernel_page_size
         # DeepGEMM paged-MQA requires 64-token pages.
         assert page_size == 64, "only support page size 64"
 
@@ -1719,13 +1753,15 @@ class IndexerKPool(MultiPlatformOp):
                 return_indices=return_indices,
             )
 
+        cp_active = self._is_prefill_cp_active(forward_batch)
         skip_logits_computation = False
         if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
-        if skip_logits_computation:
+        # The shortcut fills rows from the whole batch; under CP a rank holds its own queries
+        if skip_logits_computation and not cp_active:
             return self._forward_cuda_skip_logits(
                 x,
                 positions,
@@ -1752,6 +1788,10 @@ class IndexerKPool(MultiPlatformOp):
             precompute_compress_gate=precompute_compress_gate,
             precompute_head_gate=enable_dual_stream and return_indices,
         )
+        if cp_active:
+            key, gate_score = self._gather_key_and_gate_score(
+                x, key, gate_score, forward_batch
+            )
 
         has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
         is_prefill = forward_batch.forward_mode.is_extend_without_speculative()

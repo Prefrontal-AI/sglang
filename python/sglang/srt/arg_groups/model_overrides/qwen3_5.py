@@ -1,5 +1,6 @@
 """Config-time override declarations for qwen3_5."""
 
+import logging
 from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -13,6 +14,8 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.runtime_context import get_platform
 
+logger = logging.getLogger(__name__)
+
 
 @_register_for(
     "Qwen3NextForCausalLM",
@@ -22,6 +25,21 @@ from sglang.srt.runtime_context import get_platform
     "Qwen3_5ForConditionalGeneration",
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides = _qwen3_5_attention_overrides(server_args)
+    from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+    if parse_qsa_profile(hf_config) is not None:
+        # Compressed QSA addresses a block as full_slot // ratio, so every
+        # backend needs page-aligned pages - as for Qwen4-Exp.
+        overrides["page_size"] = 64
+        logger.info(
+            "Setting page size to 64 for compressed QSA "
+            "(full//ratio compressed addressing)."
+        )
+    return overrides
+
+
+def _qwen3_5_attention_overrides(server_args: Any) -> dict:
     cfg = resolving_view(server_args)
     if not get_platform().is_sm100 or cfg.attention_backend is not None:
         return {}

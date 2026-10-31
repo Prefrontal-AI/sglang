@@ -244,8 +244,9 @@ class TritonAttnBackend(AttentionBackend):
             and model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
         )
-        if self.is_hip_dspark_draft:
-            # Drafts never join the dcp group so we ignore it
+        if self.use_mla:
+            self._init_dcp(model_runner.is_draft_worker)
+        elif self.is_hip_dspark_draft:
             self.dcp_size = 1
             self.dcp_rank = 0
         else:
@@ -1939,6 +1940,13 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
+        # The prefix pass below reads every local KV head from the pool, against all gathered
+        # query heads. extend_attention_fwd takes its GQA group size from q.shape[1] //
+        # k_extend.shape[1], so the empty k/v it is handed must keep the pool's head count -
+        # not the one head the current-chunk pass slices out for this rank's Q shard.
+        empty_k = k[:0].contiguous()
+        empty_v = v[:0].contiguous()
+
         # Select the replicated K/V heads matching this rank's Q shard.
         if k.numel() > 0:
             if layer.tp_k_head_num > 1:
@@ -1996,8 +2004,6 @@ class TritonAttnBackend(AttentionBackend):
             device=q.device,
             dtype=torch.float32,
         )
-        empty_k = k[:0].contiguous()
-        empty_v = v[:0].contiguous()
         self.extend_attention_fwd(
             q_all,
             empty_k,

@@ -116,13 +116,18 @@ def prepare_decode_context_parallel_metadata(
     dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
         dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
     )
-    dcp_kv_buffer = torch.empty(
-        (
-            seq_lens_sum,
-            *kv_buffer_shape[1:],
-        ),
-        dtype=kv_cache_dtype,
-        device=kv_cache_device,
+    # --dcp-prefill-sparse-gather assembles a buffer of the selected rows per layer instead
+    dcp_kv_buffer = (
+        None
+        if parallel.dcp_prefill_sparse_gather
+        else torch.empty(
+            (
+                seq_lens_sum,
+                *kv_buffer_shape[1:],
+            ),
+            dtype=kv_cache_dtype,
+            device=kv_cache_device,
+        )
     )
     attn_dcp_metadata = DecodeContextParallelMetadata(
         dcp_kv_indptr=dcp_kv_indptr,

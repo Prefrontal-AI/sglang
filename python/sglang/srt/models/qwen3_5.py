@@ -1338,6 +1338,61 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
+        # Qwen sparse attention (QSA): a config that carries the indexer_* fields
+        # gets a block indexer whose top-k selection the sparse backend reads.
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+        self.is_qsa = is_qwen_qsa(config)
+        if self.is_qsa:
+            from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
+
+            self.indexer = build_qsa_indexer(
+                config=config,
+                layer_id=layer_id,
+                quant_config=quant_config,
+                prefix=f"{prefix}.indexer" if prefix else "indexer",
+                rotary_emb=self.rotary_emb,
+            )
+
+    def _compute_qsa_topk_indices(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.qsa.glue import (
+            get_qsa_indexer_metadata,
+            resolve_qsa_sparse_backend,
+        )
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        sparse_backend = resolve_qsa_sparse_backend(backend)
+        should_reuse = getattr(sparse_backend, "should_reuse_mtp_sparse_indices", None)
+        if should_reuse is not None and should_reuse(forward_batch):
+            # MTP decode steps reuse the draft-extend's target-aligned
+            # selection; the indexer never runs inside the decode graph.
+            return sparse_backend.lookup_mtp_sparse_indices(
+                forward_batch, self.layer_id
+            )
+        indexer_metadata = get_qsa_indexer_metadata(
+            backend, self.layer_id, forward_batch
+        )
+        topk_indices = self.indexer(
+            hidden_states,
+            positions,
+            forward_batch,
+            indexer_metadata,
+        )
+        should_capture = getattr(
+            sparse_backend, "should_capture_mtp_sparse_indices", None
+        )
+        if should_capture is not None and should_capture(forward_batch):
+            sparse_backend.capture_mtp_sparse_indices(
+                topk_indices, forward_batch, self.layer_id, metadata=indexer_metadata
+            )
+        return topk_indices
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1521,7 +1576,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        attention_kwargs = {}
+        if self.is_qsa:
+            attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
+                hidden_states, positions, forward_batch
+            )
+        attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
 
         if self.attn_output_gate:
             if not _is_npu:
@@ -1930,7 +1990,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in name or ".indexer." in name:
                     continue
 
                 if "mlp.experts" in name:
@@ -2392,7 +2452,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in name or ".indexer." in name:
                     continue
 
                 if "visual" in name or "mlp.experts" in name:

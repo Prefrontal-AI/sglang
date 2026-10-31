@@ -174,8 +174,13 @@ def _sparse_gqa_chunk_prefill(
     cu_q,
     cu_k,
     kv_lens,
+    slot_table,
+    slot_rows,
+    counts,
+    lse,
     scale,
     topk,
+    slot_stride,
     sq_m: tl.constexpr,
     sq_h: tl.constexpr,
     sq_d: tl.constexpr,
@@ -188,6 +193,7 @@ def _sparse_gqa_chunk_prefill(
     so_m: tl.constexpr,
     so_h: tl.constexpr,
     so_d: tl.constexpr,
+    sl_m: tl.constexpr,
     si_m: tl.constexpr,
     si_g: tl.constexpr,
     si_n: tl.constexpr,
@@ -196,6 +202,9 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HAS_SLOT_TABLE: tl.constexpr,
+    HAS_COUNTS: tl.constexpr,
+    STORE_LSE: tl.constexpr,
 ):
     query_relative = tl.program_id(0).to(tl.int64)
     batch_group = tl.program_id(1)
@@ -210,6 +219,9 @@ def _sparse_gqa_chunk_prefill(
     kv_len = tl.load(kv_lens + batch).to(tl.int64)
     visible = query_relative + kv_len - (q_end - q_start) + 1
     row_topk = tl.minimum(topk, visible)
+    if HAS_COUNTS:
+        # A row's entries past its count are padding
+        row_topk = tl.minimum(row_topk, tl.load(counts + query))
     row_limit = tl.minimum(topk, ((row_topk + BLOCK_N - 1) // BLOCK_N) * BLOCK_N)
     offs_h = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
@@ -225,6 +237,8 @@ def _sparse_gqa_chunk_prefill(
     k_base = k + k_start * sk_n + group * sk_h
     v_base = v + k_start * sv_n + group * sv_h
     idx_row = indices + query * si_m + group * si_g
+    if HAS_SLOT_TABLE:
+        slot_row = slot_table + tl.load(slot_rows + batch).to(tl.int64) * slot_stride
     max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
     normalizer = tl.zeros([BLOCK_M], tl.float32)
     accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
@@ -233,6 +247,11 @@ def _sparse_gqa_chunk_prefill(
         current = start + offs_n
         token = tl.load(idx_row + current * si_n, mask=current < topk, other=-1)
         valid = token >= 0
+        if HAS_SLOT_TABLE:
+            # Logical positions read the pool through the request's slot row
+            token = tl.load(slot_row + token, mask=valid, other=-1)
+        # A pool slot times the row stride passes int32 past a few million slots
+        token = token.to(tl.int64)
         keys = tl.load(
             k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
             mask=valid[None, :],
@@ -252,33 +271,87 @@ def _sparse_gqa_chunk_prefill(
         values = values.to(q_values.dtype)
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
-        alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.math.exp2(scores - next_max[:, None])
+        # A block with no readable key leaves the max at -inf, and -inf - -inf is NaN
+        # => shift by zero there, which adds nothing
+        shift = tl.where(next_max == -float("inf"), 0.0, next_max)
+        alpha = tl.math.exp2(max_value - shift)
+        probabilities = tl.math.exp2(scores - shift[:, None])
         accumulator = tl.dot(
             probabilities.to(values.dtype), values, accumulator * alpha[:, None]
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
-    output = accumulator / normalizer[:, None]
+    # A decode context parallel rank may hold none of a row's selected tokens
+    has_keys = normalizer > 0
+    output = tl.where(
+        has_keys[:, None],
+        accumulator / tl.where(has_keys, normalizer, 1.0)[:, None],
+        0.0,
+    )
+    head_mask = offs_h < GROUP_SIZE
     tl.store(
         out
         + query * so_m
         + (group * GROUP_SIZE + offs_h[:, None]) * so_h
         + offs_d[None, :] * so_d,
         output,
-        mask=(offs_h < GROUP_SIZE)[:, None],
+        mask=head_mask[:, None],
     )
+    if STORE_LSE:
+        # Scores are in base 2; the merge across ranks takes natural-log LSE
+        row_lse = tl.where(
+            has_keys,
+            (max_value + tl.math.log2(tl.where(has_keys, normalizer, 1.0)))
+            * 0.6931471805599453,
+            -float("inf"),
+        )
+        tl.store(
+            lse + query * sl_m + group * GROUP_SIZE + offs_h,
+            row_lse,
+            mask=head_mask,
+        )
 
 
-def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+def sparse_gqa_fwd_interface_triton_ck(
+    q,
+    k,
+    v,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    scale,
+    slot_table=None,
+    slot_rows=None,
+    counts=None,
+    max_q=None,
+    return_lse=False,
+):
+    """Sparse chunk prefill over packed K/V, or over a KV pool through a slot table.
+
+    With ``slot_table`` (``req_to_token``) and ``slot_rows`` (each sequence's row
+    in it), ``indices`` are logical positions read from the pool ``k``/``v`` in
+    place, so no per-chunk copy of the whole context is made.
+
+    ``counts`` [total_q] int32 caps each row at its leading valid entries.
+    ``max_q`` bounds the rows of one sequence without the host sync that derives it.
+    With ``return_lse`` the output is fp32 and the natural-log LSE [total_q, heads]
+    fp32 comes with it, -inf on a row with no entry, for a merge across partials.
+    """
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    if max_q is None:
+        max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
-    out = torch.empty_like(q)
+    out = torch.empty_like(q, dtype=torch.float32 if return_lse else q.dtype)
+    lse = (
+        torch.empty((total_q, num_q_heads), dtype=torch.float32, device=q.device)
+        if return_lse
+        else out
+    )
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
         k,
@@ -288,8 +361,13 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         cu_q,
         cu_k,
         kv_lens,
+        slot_table if slot_table is not None else indices,
+        slot_rows if slot_rows is not None else cu_q,
+        counts if counts is not None else cu_q,
+        lse,
         scale,
         indices.shape[-1],
+        slot_table.stride(0) if slot_table is not None else 0,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -302,6 +380,7 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        lse.stride(0) if return_lse else 0,
         indices.stride(0),
         indices.stride(1) if indices.ndim == 3 else 0,
         indices.stride(2) if indices.ndim == 3 else indices.stride(1),
@@ -310,10 +389,88 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        HAS_SLOT_TABLE=slot_table is not None,
+        HAS_COUNTS=counts is not None,
+        STORE_LSE=return_lse,
         num_warps=warps,
         num_stages=stages,
     )
+    if return_lse:
+        return out, lse
     return out
+
+
+@triton.jit
+def _own_selected_tokens(
+    indices,
+    row_batch,
+    slot_table,
+    slot_rows,
+    local,
+    counts,
+    topk,
+    slot_stride,
+    dcp_rank,
+    si_m: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    batch = tl.load(row_batch + row)
+    slot_row = slot_table + tl.load(slot_rows + batch).to(tl.int64) * slot_stride
+    cols = tl.arange(0, BLOCK)
+    in_row = cols < topk
+    token = tl.load(indices + row * si_m + cols, mask=in_row, other=-1)
+    valid = token >= 0
+    slot = tl.load(slot_row + token, mask=valid, other=-1)
+    owned = valid & (slot % DCP_SIZE == dcp_rank)
+    count = tl.sum(owned.to(tl.int32), 0)
+    # Owned entries keep their order at the front of the row, the rest is padding
+    position = tl.cumsum(owned.to(tl.int32), 0) - 1
+    tl.store(local + row * topk + position, slot // DCP_SIZE, mask=owned)
+    tl.store(local + row * topk + cols, -1, mask=in_row & (cols >= count))
+    tl.store(counts + row, count)
+
+
+def qsa_own_selected_tokens(
+    indices, row_batch, slot_table, slot_rows, dcp_size, dcp_rank
+):
+    """Keep the selected tokens this decode context parallel rank holds, as its local KV rows.
+
+    A rank holds the slots with ``slot % dcp_size == dcp_rank``, at row ``slot // dcp_size``.
+
+    Args:
+        indices: Selected logical positions per row, valid first [rows, topk] int32.
+        row_batch: Each row's sequence [rows] int32.
+        slot_table: Each sequence's slots by logical position, ``req_to_token``.
+        slot_rows: Each sequence's row in ``slot_table`` [batch] int32.
+        dcp_size: Decode context parallel ranks.
+        dcp_rank: This rank.
+
+    Returns:
+        The local KV rows, valid first and -1 after [rows, topk] int32, and each row's count [rows] int32.
+    """
+    rows, topk = indices.shape
+    local = torch.empty_like(indices, dtype=torch.int32)
+    counts = torch.empty(rows, dtype=torch.int32, device=indices.device)
+    if rows == 0:
+        return local, counts
+    _own_selected_tokens[(rows,)](
+        indices,
+        row_batch,
+        slot_table,
+        slot_rows,
+        local,
+        counts,
+        topk,
+        slot_table.stride(0),
+        dcp_rank,
+        si_m=indices.stride(0),
+        DCP_SIZE=dcp_size,
+        BLOCK=triton.next_power_of_2(topk),
+        num_warps=8,
+    )
+    return local, counts
 
 
 def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
@@ -340,8 +497,13 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         cu_q,
         cu_k,
         kv_lens,
+        indices,
+        cu_q,
+        cu_q,
+        out,
         scale,
         indices.shape[-1],
+        0,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -354,6 +516,7 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        0,
         indices.stride(0),
         indices.stride(1) if indices.ndim == 3 else 0,
         indices.stride(2) if indices.ndim == 3 else indices.stride(1),
@@ -362,6 +525,9 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        HAS_SLOT_TABLE=False,
+        HAS_COUNTS=False,
+        STORE_LSE=False,
         num_warps=warps,
         num_stages=stages,
     )
@@ -565,6 +731,7 @@ def qwen_sparse_kv_extraction_compact_triton(
 
 
 __all__ = [
+    "qsa_own_selected_tokens",
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",

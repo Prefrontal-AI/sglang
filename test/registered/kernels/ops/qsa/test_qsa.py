@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.qsa.mqa import (
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    qsa_own_selected_tokens,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -96,6 +97,104 @@ def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
         scale,
     )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_qsa_chunk_prefill_dcp_partials_merge_to_single_pool():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dcp_size, num_q_heads, num_kv_heads, head_dim, topk = 4, 24, 4, 128, 64
+    seq_lens = [300, 200]
+    extend_lens = [64, 1]
+    num_slots = 1024
+    # Requests own scattered virtual slots, so every rank holds part of each
+    slot_order = torch.randperm(num_slots - dcp_size, device=device) + dcp_size
+    req_to_token = torch.zeros((3, 512), dtype=torch.int32, device=device)
+    req_to_token[1, :300] = slot_order[:300].to(torch.int32)
+    req_to_token[2, :200] = slot_order[300:500].to(torch.int32)
+    slot_rows = torch.tensor([1, 2], dtype=torch.int32, device=device)
+    k = torch.randn(
+        num_slots, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v = torch.randn_like(k)
+
+    rows = []
+    for seq_len, extend_len in zip(seq_lens, extend_lens):
+        for i in range(extend_len):
+            visible = seq_len - extend_len + i + 1
+            count = min(topk, visible)
+            row = torch.full((topk,), -1, dtype=torch.int32)
+            row[:count] = torch.randperm(visible)[:count].to(torch.int32)
+            rows.append(row)
+    # One token selected leaves most ranks with nothing of the row
+    rows[0][:] = -1
+    rows[0][0] = 0
+    indices = torch.stack(rows).to(device)
+    q = torch.randn(
+        indices.shape[0], num_q_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    cu_q = torch.tensor([0, 64, 65], dtype=torch.int32, device=device)
+    cu_k = torch.zeros_like(cu_q)
+    kv_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    scale = head_dim**-0.5
+
+    expected = sparse_gqa_fwd_interface_triton_ck(
+        q,
+        k,
+        v,
+        indices,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+        slot_table=req_to_token,
+        slot_rows=slot_rows,
+    )
+    row_batch = torch.tensor([0] * 64 + [1], dtype=torch.int32, device=device)
+    partials, lses, held = [], [], 0
+    for rank in range(dcp_size):
+        local_rows, counts = qsa_own_selected_tokens(
+            indices, row_batch, req_to_token, slot_rows, dcp_size, rank
+        )
+        # The held rows are exactly the selected slots this rank owns, in order
+        slots = req_to_token[
+            slot_rows[row_batch.long()].long()[:, None], indices.clamp_min(0).long()
+        ]
+        owned = (indices >= 0) & (slots % dcp_size == rank)
+        for row in (0, 5, 64):
+            assert (
+                local_rows[row, : counts[row]].tolist()
+                == (slots[row][owned[row]] // dcp_size).tolist()
+            )
+            assert (local_rows[row, counts[row] :] == -1).all()
+        held += int(counts.sum())
+        partial, lse = sparse_gqa_fwd_interface_triton_ck(
+            q,
+            k[rank::dcp_size].contiguous(),
+            v[rank::dcp_size].contiguous(),
+            local_rows,
+            cu_q,
+            cu_k,
+            kv_lens,
+            scale,
+            counts=counts,
+            max_q=64,
+            return_lse=True,
+        )
+        partials.append(partial)
+        lses.append(lse)
+    assert held == int((indices >= 0).sum())
+    lses = torch.stack(lses)
+    weights = torch.exp(lses - torch.logsumexp(lses, dim=0)).unsqueeze(-1)
+    merged = (weights * torch.stack(partials)).sum(0)
+
+    assert torch.isfinite(merged).all()
+    assert (lses[:, 0] == -float("inf")).any()
+    torch.testing.assert_close(
+        merged.to(torch.bfloat16), expected, rtol=2e-2, atol=2e-2
+    )
 
 
 @pytest.mark.parametrize(
@@ -363,6 +462,8 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
         req_to_token_pool=None,
         kv_index_translator=None,
         needs_cpu_seq_lens=True,
+        dcp_size=1,
+        dcp_rank=0,
     )
     hybrid = HybridLinearAttnBackend(
         full_attn_backend=full,
@@ -1067,6 +1168,87 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
         (columns < starts[:, None]) | (columns >= ends[:, None]), -float("inf")
     )
     torch.testing.assert_close(actual, expected)
+
+
+def test_qsa_chunk_prefill_reads_the_pool_through_a_slot_table_bit_exactly():
+    if not torch.cuda.is_available():
+        return
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+    # Two requests whose contexts sit scattered in a pool, read in place through
+    # req_to_token, against the same contexts gathered and packed
+    lengths, chunk, heads, kv_heads, head_dim, topk = [300, 200], 8, 4, 1, 128, 64
+    pool_size = 1024
+    k_pool = torch.randn(
+        pool_size, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_pool = torch.randn(
+        pool_size, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    slots = torch.randperm(pool_size, device=device)[: sum(lengths)].to(torch.int32)
+    req_to_token = torch.zeros(4, 512, dtype=torch.int32, device=device)
+    rows = torch.tensor([2, 0], dtype=torch.int32, device=device)
+    req_to_token[2, : lengths[0]] = slots[: lengths[0]]
+    req_to_token[0, : lengths[1]] = slots[lengths[0] :]
+    q = torch.randn(2 * chunk, heads, head_dim, dtype=torch.bfloat16, device=device)
+    indices = torch.cat(
+        [
+            torch.randperm(length, device=device)[:topk].repeat(chunk, 1)
+            for length in lengths
+        ]
+    ).to(torch.int32)
+    indices[::3, -5:] = -1
+    cu_q = torch.tensor([0, chunk, 2 * chunk], dtype=torch.int32, device=device)
+    kv_lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    scale = head_dim**-0.5
+
+    in_place = sparse_gqa_fwd_interface_triton_ck(
+        q,
+        k_pool,
+        v_pool,
+        indices,
+        cu_q,
+        torch.zeros_like(cu_q),
+        kv_lens,
+        scale,
+        slot_table=req_to_token,
+        slot_rows=rows,
+    )
+    packed_k = torch.cat(
+        [k_pool[slots[: lengths[0]].long()], k_pool[slots[lengths[0] :].long()]]
+    )
+    packed_v = torch.cat(
+        [v_pool[slots[: lengths[0]].long()], v_pool[slots[lengths[0] :].long()]]
+    )
+    cu_k = torch.tensor([0, lengths[0], sum(lengths)], dtype=torch.int32, device=device)
+    packed = sparse_gqa_fwd_interface_triton_ck(
+        q, packed_k, packed_v, indices, cu_q, cu_k, kv_lens, scale
+    )
+    assert torch.equal(in_place, packed)
+
+
+def test_qsa_cuda_prefill_logits_split_over_keys_match_explicit_formula():
+    if not torch.cuda.is_available():
+        return
+    torch.manual_seed(3)
+    # Ragged ranges that start and end inside a CTA's keys and span several CTAs,
+    # and a row count that is not a multiple of the kernel's row block
+    rows, keys = 37, 5000
+    q = torch.randn(rows, 4, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(keys, 1, 128, dtype=torch.bfloat16, device="cuda")
+    starts = torch.randint(0, 3000, (rows,), dtype=torch.int32, device="cuda")
+    ends = torch.minimum(
+        starts + torch.randint(1, 4000, (rows,), dtype=torch.int32, device="cuda"),
+        torch.tensor(keys, dtype=torch.int32, device="cuda"),
+    )
+    actual = qsa_mqa_prefill(q, k, starts, ends)
+    expected = torch.einsum("mhd,nhd->mnh", q.float(), k.expand(-1, 4, -1).float())
+    expected = torch.relu(expected).sum(-1) / (128**0.5)
+    columns = torch.arange(keys, device="cuda").unsqueeze(0)
+    expected.masked_fill_(
+        (columns < starts[:, None]) | (columns >= ends[:, None]), -float("inf")
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):

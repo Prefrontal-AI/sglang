@@ -367,6 +367,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
     if cfg := mambaish_config(runner.model_config):
         from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+        from sglang.srt.layers.cp.base import is_cp_enabled
+        from sglang.srt.runtime_context import get_parallel
 
         if isinstance(
             runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)
@@ -534,6 +536,48 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "Expected hybrid GDN or NemotronH models, but got unknown model. "
                     "If this is a custom hybrid model, use register_linear_attn_model() "
                     "from sglang.srt.configs.linear_attn_model_registry."
+                )
+
+        if is_cp_enabled() or get_parallel().attn_cp_size > 1:
+            # The CP-v2 runner shards prefill tokens across ranks, but linear
+            # layers' recurrent state has no position axis to shard — it needs
+            # the KDA state hand-off (pre-scan + all-gather + merge, see
+            # kernels/ops/attention/fla/chunk_delta_h_cp.py), which is wired
+            # only for the text-only KimiLinear model under the contiguous
+            # shard layout.
+            # Fail loudly for every other hybrid linear combination.
+            kda_cp_ready = (
+                isinstance(linear_attn_backend, KDAAttnBackend)
+                and (
+                    kimi_linear_config(runner.model_config)
+                    is runner.model_config.hf_config
+                    or glm5_next_config(runner.model_config) is not None
+                )
+                and runner.server_args.cp_strategy == "contiguous"
+            )
+            if not kda_cp_ready:
+                raise NotImplementedError(
+                    "Prefill context parallelism for hybrid linear-attention "
+                    "models is currently only supported for the text-only "
+                    "KimiLinearForCausalLM and GLM-5.3-Flash models with "
+                    "--cp-strategy contiguous. "
+                    "Kimi-K3 and other KDA-backed wrappers have not yet been "
+                    "ported to the CP-v2 model-boundary and layer-communicator "
+                    "contracts."
+                )
+            from sglang.srt.layers.attention.dsa_backend import (
+                DeepseekSparseAttnBackend,
+            )
+
+            # DSA gathers the DCP-sharded prefix for prefill and never takes MHA one-shot under DCP
+            if get_parallel().dcp_enabled and not isinstance(
+                full_attn_backend, DeepseekSparseAttnBackend
+            ):
+                raise NotImplementedError(
+                    "KDA prefill context parallelism combines with decode "
+                    "context parallelism (--dcp-size > 1) only on the DSA "
+                    "backend. The MHA one-shot CP path requires a full causal "
+                    "KV window, while DCP stores only the current rank's KV shard."
                 )
         if runner.is_draft_worker:
             # FIXME: we assume that MTP/NEXTN always use full-attention.

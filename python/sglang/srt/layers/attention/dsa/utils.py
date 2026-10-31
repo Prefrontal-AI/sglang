@@ -148,13 +148,22 @@ def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     )
 
 
-def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
+def can_dsa_prefill_cp_shard(forward_batch: "ForwardBatch"):
+    """Whether DSA metadata must be localized to this rank's CP queries."""
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
+    if not is_dsa_enable_prefill_cp():
+        return False
+    cp_strategy = get_parallel().cp_strategy
+    if cp_strategy == "contiguous":
+        from sglang.srt.layers.cp.utils import is_cp_active
+
+        # Mirrors the runner: a batch the strategy cannot split runs unsharded
+        return is_cp_active(forward_batch)
     cp_size = get_parallel().attn_cp_size
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
     return (
-        is_dsa_prefill_cp_interleave()
+        cp_strategy == "interleave"
         and seq_len > 0
         and seq_len >= cp_size
         and cp_size > 1
@@ -186,14 +195,14 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         tokens = max(global_num_tokens)
     else:
         tokens = global_num_tokens[dp_slot_in(global_num_tokens)]
-    if can_dsa_prefill_cp_interleave(forward_batch):
+    if can_dsa_prefill_cp_shard(forward_batch):
         tokens = ceil_div(tokens, attn_cp_size)
     return tokens
 
 
 def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
     attn_cp_size = get_parallel().attn_cp_size
-    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_interleave(forward_batch)
+    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_shard(forward_batch)
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
     if not needs_cp_pad and not needs_dp_pad:
         return dsa_cache_seqlens

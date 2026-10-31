@@ -3034,6 +3034,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 prefix_len
                 + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
+        # Prefill CP holds the merged recurrent state only at the end of the extend
+        # => track only a checkpoint that is the extend's last token
+        prefill_cp = get_parallel().enable_prefill_cp
+        if prefill_cp:
+            mask = mask and mamba_track_seqlen_aligned == seq_end
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()
@@ -3069,7 +3074,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.kv.mamba_next_track_idx
                     )
                 )
-            if req.mamba_branching_seqlen is not None:
+            if req.mamba_branching_seqlen is not None and not prefill_cp:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (

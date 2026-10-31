@@ -41,6 +41,20 @@ def get_dcp_lens(
     return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
 
 
+def is_dcp_over_attn_cp() -> bool:
+    """DCP shards the KV over the prefill-CP group, whose ranks hold every head.
+
+    Decode then attends with all heads locally: no Q head gather, and the
+    partial outputs merge by all-reduce rather than reduce-scatter.
+    """
+    parallel = get_parallel()
+    return (
+        parallel.dcp_enabled
+        and parallel.attn_tp_size == 1
+        and parallel.attn_cp_size == parallel.attn_dcp_size
+    )
+
+
 def maybe_dcp_kernel_indices(
     indices: torch.Tensor, dcp_size: int, dcp_rank: int
 ) -> torch.Tensor:

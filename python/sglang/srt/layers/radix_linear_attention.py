@@ -32,6 +32,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.kda_head_shard import KDAHeadShard
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -56,8 +57,11 @@ class RadixLinearAttention(nn.Module):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        decode_head_shard: Optional[KDAHeadShard] = None,
     ):
         super().__init__()
+        # Set on a KDA layer's decode twin: which block of the full layer's heads it runs
+        self.decode_head_shard = decode_head_shard
         self.layer_id = layer_id
         self.num_q_heads = num_q_heads
         self.num_k_heads = num_k_heads

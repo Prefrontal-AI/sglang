@@ -479,8 +479,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /tmp/mscclpp
 
 # Install essential Python packages (use constraints to prevent conflicts)
+# python-dateutil 3.0.0 conflicts with every botocore (<3), so cap it - pip otherwise backtracks until resolution-too-deep
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    sed -i 's/^python-dateutil==.*/python-dateutil<3/' /sgl-workspace/constraints.txt \
+    && python3 -m pip install -c /sgl-workspace/constraints.txt \
     datamodel_code_generator \
     pre-commit \
     pytest \

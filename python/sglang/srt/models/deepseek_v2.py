@@ -2138,10 +2138,18 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # Set after loading when decode splits the heads over the prefill-CP group;
+        # decode_heads_split is True only while that view is swapped in
+        self.decode_head_view = None
+        self.decode_heads_split = False
+
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if get_parallel().dcp_enabled:
+            from sglang.srt.layers.dcp.layout import is_dcp_over_attn_cp
+
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads
+                * (1 if is_dcp_over_attn_cp() else get_parallel().attn_dcp_size),
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,
@@ -2291,6 +2299,37 @@ class DeepseekV2AttentionMLA(
         layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+    ):
+        if self.decode_head_view is not None and forward_batch.forward_mode.is_decode():
+            with self.decode_head_view.active(self):
+                return self._forward_prepare_and_core(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    zero_allocator,
+                    layer_scatter_modes,
+                    llama_4_scaling,
+                    prev_topk_indices,
+                )
+        return self._forward_prepare_and_core(
+            positions,
+            hidden_states,
+            forward_batch,
+            zero_allocator,
+            layer_scatter_modes,
+            llama_4_scaling,
+            prev_topk_indices,
+        )
+
+    def _forward_prepare_and_core(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        zero_allocator,
+        layer_scatter_modes,
+        llama_4_scaling,
+        prev_topk_indices,
     ):
         s = self.forward_prepare(
             positions=positions,

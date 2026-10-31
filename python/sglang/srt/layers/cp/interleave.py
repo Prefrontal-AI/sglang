@@ -133,13 +133,14 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             self.cp_rank, int(num_tokens), self.cp_size, device=device, dtype=torch.long
         )
 
-    def shard_local_tokens(self, input_: Any) -> Any:
+    def shard_local_tokens(self, input_: Any, forward_batch=None) -> Any:
         return self._interleave_shard(input_)
 
     def shard_per_request(
         self,
         extend_seqs_cpu: List[int],
         extend_seqs: Any,
+        forward_batch=None,
     ):
         """Build device outputs in the shared kernel to keep the split graph-safe."""
         from sglang.kernels.ops.attention.dsa.cp_split import (

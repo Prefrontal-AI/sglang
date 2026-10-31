@@ -139,6 +139,14 @@ class Parallel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    dcp_prefill_sparse_gather: A[
+        bool,
+        "DSA prefill under decode context parallelism: gather only the prefix KV "
+        "rows the chunk's selected lists name, instead of all-gathering the whole "
+        "prefix per layer and chunk. Output is bit-identical; saves the prefix "
+        "gather's time (growing with context) and its prefix-sized buffer. "
+        "Requires --dcp-size > 1 and a DSA model.",
+    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -146,8 +154,8 @@ class Parallel(msgspec.Struct):
     cp_strategy: A[
         Optional[str],
         Arg(
-            help="Sharding strategy for prefill CP. 'zigzag' assigns each rank one early and one late sequence block; 'interleave' assigns token indices modulo the CP size.",
-            choices=("zigzag", "interleave"),
+            help="Sharding strategy for prefill CP. 'zigzag' assigns each rank one early and one late sequence block; 'interleave' assigns token indices modulo the CP size; 'contiguous' gives each rank one contiguous block per sequence (required by hybrid linear-attention models, e.g. KDA).",
+            choices=("zigzag", "interleave", "contiguous"),
         ),
     ] = None
     # Split DSA GPU KV/indexer cache layers across CP ranks.

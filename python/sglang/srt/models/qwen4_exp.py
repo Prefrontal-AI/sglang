@@ -1524,58 +1524,9 @@ class Qwen4ExpAttentionDecoderLayer(
         is_nextn: bool = False,
     ) -> None:
         config.attn_output_gate = True
+        # The base layer builds the QSA indexer and computes its selection
         super().__init__(config, layer_id, quant_config, prefix, alt_stream, is_nextn)
-        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
-        from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
-
-        self.is_qsa = is_qwen_qsa(config)
-        if self.is_qsa:
-            self.indexer = build_qsa_indexer(
-                config=config,
-                layer_id=layer_id,
-                quant_config=quant_config,
-                prefix=f"{prefix}.indexer" if prefix else "indexer",
-                rotary_emb=self.rotary_emb,
-            )
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
-
-    def _compute_qsa_topk_indices(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.attention.qsa.glue import (
-            get_qsa_indexer_metadata,
-            resolve_qsa_sparse_backend,
-        )
-
-        backend = get_attn_backend()
-        sparse_backend = resolve_qsa_sparse_backend(backend)
-        should_reuse = getattr(sparse_backend, "should_reuse_mtp_sparse_indices", None)
-        if should_reuse is not None and should_reuse(forward_batch):
-            # MTP decode steps reuse the draft-extend's target-aligned
-            # selection; the indexer never runs inside the decode graph.
-            return sparse_backend.lookup_mtp_sparse_indices(
-                forward_batch, self.layer_id
-            )
-        indexer_metadata = get_qsa_indexer_metadata(
-            backend, self.layer_id, forward_batch
-        )
-        topk_indices = self.indexer(
-            hidden_states,
-            positions,
-            forward_batch,
-            indexer_metadata,
-        )
-        should_capture = getattr(
-            sparse_backend, "should_capture_mtp_sparse_indices", None
-        )
-        if should_capture is not None and should_capture(forward_batch):
-            sparse_backend.capture_mtp_sparse_indices(
-                topk_indices, forward_batch, self.layer_id, metadata=indexer_metadata
-            )
-        return topk_indices
 
     def self_attention(
         self,

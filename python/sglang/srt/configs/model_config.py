@@ -1517,7 +1517,8 @@ class ModelConfig:
         total_num_kv_heads = self.get_total_num_kv_heads()
         if self.is_draft_model:
             dcp_size = 1
-        kv_tensor_parallel_size = tensor_parallel_size // dcp_size
+        # DCP over the prefill-CP group has attention TP 1: every rank keeps every head
+        kv_tensor_parallel_size = max(1, tensor_parallel_size // dcp_size)
         return max(1, total_num_kv_heads // kv_tensor_parallel_size)
 
     def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:

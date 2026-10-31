@@ -36,6 +36,8 @@ def _track_seqlen(
     prefix_len: int,
     extend_len: int,
     dcp_enabled: bool = False,
+    prefill_cp: bool = False,
+    branching_seqlen: int | None = None,
 ) -> int | None:
     """Run one extend through the tracker and report the donated depth, or
     None when the extend donates no checkpoint."""
@@ -57,7 +59,7 @@ def _track_seqlen(
     req.set_extend_range(prefix_len, prefix_len + extend_len)
     req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
     req.kv.mamba_next_track_idx = 0
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching_seqlen
 
     batch = ScheduleBatch(reqs=[req])
     batch.model_config = SimpleNamespace(
@@ -69,7 +71,9 @@ def _track_seqlen(
 
     with patch(
         "sglang.srt.managers.schedule_batch.get_parallel",
-        return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
+        return_value=SimpleNamespace(
+            dcp_enabled=dcp_enabled, enable_prefill_cp=prefill_cp
+        ),
     ):
         entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
     if not entry.track_mask:
@@ -122,6 +126,48 @@ class TestMambaCheckpointDepth(unittest.TestCase):
             _track_seqlen(tree_page=16, prefix_len=4253, extend_len=16384),
             20637,
         )
+
+
+class TestMambaCheckpointUnderPrefillCP(unittest.TestCase):
+    # Prefill CP merges the recurrent state only at the end of the extend, so a
+    # checkpoint is donated only when it is the extend's last token.
+    def test_chunk_end_is_tracked(self):
+        self.assertEqual(
+            _track_seqlen(
+                tree_page=512,
+                prefix_len=32768,
+                extend_len=32768,
+                dcp_enabled=True,
+                prefill_cp=True,
+            ),
+            65536,
+        )
+
+    def test_unaligned_tail_is_not_tracked(self):
+        # Without CP the tail tracks 66048 from an intermediate chunk state
+        for prefill_cp, expected in ((False, 66048), (True, None)):
+            with self.subTest(prefill_cp=prefill_cp):
+                self.assertEqual(
+                    _track_seqlen(
+                        tree_page=512,
+                        prefix_len=32768,
+                        extend_len=33380,
+                        dcp_enabled=True,
+                        prefill_cp=prefill_cp,
+                    ),
+                    expected,
+                )
+
+    def test_branching_point_inside_the_extend_is_not_tracked(self):
+        depth = _track_seqlen(
+            tree_page=512,
+            prefix_len=0,
+            extend_len=32768,
+            dcp_enabled=True,
+            prefill_cp=True,
+            branching_seqlen=8192,
+        )
+        self.assertEqual(depth, 32768)
 
 
 class TestMambaTrackGrid(unittest.TestCase):

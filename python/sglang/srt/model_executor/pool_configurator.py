@@ -228,9 +228,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
                 if is_deepseek_dsa(kvc.model_config.hf_config):
-                    target_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=num_layers,
+                    target_indexer_size = (
+                        self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=num_layers,
+                        )
+                        * get_parallel().attn_dcp_size
                     )
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
@@ -240,13 +243,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = int(
-                        target_kv_size * draft_num_layers / target_kv_num_layers
+                    dcp_size = get_parallel().attn_dcp_size
+                    draft_kv_size = (
+                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
+                        * dcp_size
                     )
-                    draft_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=draft_num_layers,
-                        allocate_all_layers=True,
+                    draft_indexer_size = (
+                        self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=draft_num_layers,
+                            allocate_all_layers=True,
+                        )
+                        * dcp_size
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
@@ -336,9 +344,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                cell_size += self._compute_dsa_indexer_cell_size(
-                    kvc=kvc,
-                    num_layers=num_layers,
+                cell_size += (
+                    self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=num_layers,
+                    )
+                    * dcp_size
                 )
         elif is_minimax_sparse(model_config.hf_config):
             from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
@@ -462,11 +473,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         qsa_profile = parse_qsa_profile(hf_config)
         if qsa_profile is None:
             return 0
-        return QSATokenToKVPool.qsa_bytes_per_token(
-            kv_heads=qsa_profile.kv_heads,
-            head_dim=qsa_profile.head_dim,
-            compress_ratio=qsa_profile.compress_ratio,
-            num_layers=num_layers,
+        # The index is replicated across decode context parallel ranks,
+        # so a rank's KV row carries every rank's index share
+        return (
+            QSATokenToKVPool.qsa_bytes_per_token(
+                kv_heads=qsa_profile.kv_heads,
+                head_dim=qsa_profile.head_dim,
+                compress_ratio=qsa_profile.compress_ratio,
+                num_layers=num_layers,
+            )
+            * get_parallel().attn_dcp_size
         )
 
     def _compute_dsa_indexer_cell_size(

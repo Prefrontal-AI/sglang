@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    qsa_own_selected_tokens,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -37,7 +38,9 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
 )
+from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -179,6 +182,11 @@ class QwenSparseAttnBackend(AttentionBackend):
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
+        # The pool spreads its slots over the decode context parallel ranks,
+        # and this rank holds those with slot % dcp_size == dcp_rank
+        self.dcp_size = int(getattr(self.token_to_kv_pool, "qsa_slot_space_scale", 1))
+        if self.dcp_size > 1:
+            self.dcp_rank = get_parallel().attn_dcp_rank
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
@@ -1274,9 +1282,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._save_kv(layer, forward_batch, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1288,6 +1294,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         # DP attention may pad q beyond the indexer's query rows.
         # The kernels see only valid rows; the output is zero-padded to q's row count.
         q = q[:num_valid_rows]
+        if self.dcp_size > 1:
+            output = self._forward_dcp(q, layer, forward_batch, topk_indices)
+            return self._pad_extend_output(output, num_output_rows)
         if self._is_speculative_paged_mode(forward_batch.forward_mode):
             output = self._forward_paged_attention(
                 q, layer, forward_batch, topk_indices
@@ -1328,38 +1337,26 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
-        # The validated chunk-prefill kernel consumes tightly packed full-context
-        # K/V. Current-chunk K/V has already been committed to the cache above.
+        # Current-chunk K/V has already been committed to the cache above, so the
+        # kernel reads every selected token from the pool through req_to_token.
+        # Gathering the whole context instead cost two copies of it per chunk and
+        # layer - about 10 GB per card at 5M tokens on tp 4, which ran out of memory.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
-        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            pool.get_key_buffer(layer.layer_id),
+            pool.get_value_buffer(layer.layer_id),
             topk_indices,
             cu_seqlens_q,
-            cu_seqlens_k,
+            torch.zeros_like(cu_seqlens_q),
             sequence_lens_tensor,
             layer.scaling,
+            slot_table=self.req_to_token_pool.req_to_token,
+            slot_rows=forward_batch.req_pool_indices.to(torch.int32),
+            max_q=max(extend_lens, default=1),
         )
         return self._pad_extend_output(output, num_output_rows)
 
@@ -1389,9 +1386,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         buffers = self._fa2_scratch.get(key)
         if buffers is None or buffers[0].shape[0] < capacity:
             shape = (capacity, num_kv_heads, head_dim)
+            # The attention kernels load whole K/V tiles past the last row's
+            # cu_seqlens_k end and only mask the scores, so P (0) still meets
+            # those rows' V. Stale inf/NaN bytes there (e.g. a -inf logits fill
+            # that last held this memory) turn 0 * inf into NaN in the last row.
+            # Zero once; the extraction only ever writes finite K/V after that.
             buffers = (
-                torch.empty(shape, dtype=dtype, device=device),
-                torch.empty(shape, dtype=dtype, device=device),
+                torch.zeros(shape, dtype=dtype, device=device),
+                torch.zeros(shape, dtype=dtype, device=device),
             )
             self._fa2_scratch[key] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
@@ -1512,11 +1514,102 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._save_kv(layer, forward_batch, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        if self.dcp_size > 1:
+            return self._forward_dcp(q, layer, forward_batch, topk_indices)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
+
+    def _save_kv(self, layer, forward_batch, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Write the forward's K/V, under decode context parallel only the slots this rank owns."""
+        loc = forward_batch.out_cache_loc
+        if self.dcp_size == 1:
+            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
+            return
+        self.token_to_kv_pool.set_kv_buffer(
+            layer,
+            loc // self.dcp_size,
+            k,
+            v,
+            dcp_kv_mask=loc % self.dcp_size == self.dcp_rank,
+        )
+
+    def _forward_dcp(
+        self,
+        q: torch.Tensor,
+        layer,
+        forward_batch,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend every query head to the selected tokens this rank owns, then merge the ranks by LSE.
+
+        Every rank selects the same tokens from its replicated index, so the merged
+        output is the single-mesh attention over the full selection.
+
+        Args:
+            q: This rank's query heads [rows, heads / dcp_size, head_dim].
+            layer: The attention layer.
+            forward_batch: The forward batch.
+            topk_indices: Selected logical positions per row [rows, topk] int32.
+
+        Returns:
+            This rank's heads of the attention output [rows, heads / dcp_size * head_dim].
+
+        Raises:
+            NotImplementedError: The forward is a speculative verify or draft extend.
+        """
+        if self._is_speculative_paged_mode(forward_batch.forward_mode):
+            raise NotImplementedError(
+                "QSA under decode context parallel has no speculative decoding path"
+            )
+        metadata = self._resolve_metadata(forward_batch)
+        group = get_parallel().dcp_group
+        num_rows = q.shape[0]
+        q_all = group.all_gather(q.contiguous(), dim=1)
+        if forward_batch.forward_mode.is_decode():
+            max_q = 1
+            if metadata.is_cuda_graph:
+                cu_seqlens_q = metadata.fa2_cu_seqlens_q
+            else:
+                cu_seqlens_q = torch.arange(
+                    num_rows + 1, dtype=torch.int32, device=q.device
+                )
+        else:
+            max_q = max(int(x) for x in forward_batch.extend_seq_lens_cpu)
+            cu_seqlens_q = F.pad(
+                forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
+                (1, 0),
+            )
+        slot_rows = (
+            metadata.row_req_pool_indices
+            if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices
+        )
+        # Each rank loops over only the selected tokens it holds
+        local_rows, counts = qsa_own_selected_tokens(
+            topk_indices.to(torch.int32).contiguous(),
+            metadata.token_to_batch_idx[:num_rows],
+            self.req_to_token_pool.req_to_token,
+            slot_rows.to(torch.int32),
+            self.dcp_size,
+            self.dcp_rank,
+        )
+        pool = self.token_to_kv_pool
+        partial, lse = sparse_gqa_fwd_interface_triton_ck(
+            q_all,
+            pool.get_key_buffer(layer.layer_id),
+            pool.get_value_buffer(layer.layer_id),
+            local_rows,
+            cu_seqlens_q.contiguous(),
+            torch.zeros_like(cu_seqlens_q),
+            metadata.sequence_lengths.to(torch.int32),
+            layer.scaling,
+            counts=counts,
+            max_q=max_q,
+            return_lse=True,
+        )
+        output = cp_lse_ag_out_rs_mha(partial, lse, group)
+        return output.to(q.dtype).reshape(num_rows, -1)
 
     def _forward_paged_attention(
         self,

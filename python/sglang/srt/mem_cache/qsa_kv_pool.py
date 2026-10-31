@@ -62,6 +62,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         qsa_compress_ratio: int,
         qsa_token_topk: int,
         num_request_slots: int,
+        slot_space_scale: int = 1,
         enable_memory_saver: bool = False,
         enable_kv_cache_copy: bool = False,
         start_layer: Optional[int] = None,
@@ -117,7 +118,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_index_kv_heads = int(qsa_index_kv_heads)
         self.qsa_token_topk = int(qsa_token_topk)
         self.qsa_block_topk = self.qsa_token_topk // self.qsa_compress_ratio
-        state_size = size + page_size
+        # Under decode context parallel the pool holds this rank's share of the KV
+        # while slots stay global, so the replicated index spans every rank's slots.
+        if slot_space_scale <= 0:
+            raise ValueError(
+                f"QSA slot space scale must be positive, got {slot_space_scale}"
+            )
+        self.qsa_slot_space_scale = int(slot_space_scale)
+        state_size = (size + page_size) * self.qsa_slot_space_scale
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio

@@ -19,6 +19,10 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
     should_report_expert_balancedness,
 )
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -27,6 +31,9 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
+
+# Prefill kernels that read the gathered KV buffer and remapped index lists DCP hands them
+DSA_DCP_PREFILL_BACKENDS = ("tilelang", "flashmla_sparse", "fa3")
 
 
 def handle_context_parallelism(server_args: Any):
@@ -162,6 +169,9 @@ def handle_shared_experts_tp(server_args: Any):
 
 
 def handle_decode_context_parallelism(server_args: Any):
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
     run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
@@ -193,6 +203,74 @@ def handle_decode_context_parallelism(server_args: Any):
                 "communication backend (it removes the head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
+
+    if cfg.dcp_prefill_sparse_gather and (
+        cfg.dcp_size <= 1 or not is_deepseek_dsa(model_config_of(server_args).hf_config)
+    ):
+        raise ValueError(
+            "--dcp-prefill-sparse-gather gathers the prefix rows a DSA layer's "
+            "lists name, and requires --dcp-size > 1 and a DSA model."
+        )
+
+    if (
+        cfg.dcp_size == 1
+        or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
+    ):
+        return
+
+    model_config = model_config_of(server_args)
+    # Prefill CP shares DCP's ranks: attention TP 1 and one KV shard per CP rank
+    prefill_cp_over_dcp_ranks = (
+        cfg.cp_strategy == "contiguous"
+        and cfg.attn_cp_size == cfg.dcp_size == cfg.tp_size
+        and cfg.dcp_comm_backend == "ag_rs"
+    )
+    # A QSA checkpoint attends through Qwen's sparse backend whatever backend is named,
+    # and that backend reads its own KV shard under DCP
+    is_qsa = is_qwen_qsa(model_config.hf_config)
+    if get_platform().is_cuda and not use_mla_backend(server_args) and not is_qsa:
+        # Only the Triton backend (prefill and decode) and the FA3 backend
+        # (prefill/extend only) shard a GQA/MHA KV cache by token under DCP
+        # (owner rule pos % dcp_size, rank-local kv indices, LSE merge across
+        # the DCP group). FA3 decode, flashinfer, trtllm_mha and the rest read
+        # the whole page table, so with --dcp-size > 1 they would attend over
+        # wrong/partial KV and return garbage without any error. An unset
+        # backend resolves to one of those later, so it is refused too.
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
+        bad_backends = sorted(
+            ({prefill_backend} - {"triton", "fa3"})
+            | ({decode_backend} - {"triton"}),
+            key=str,
+        )
+        if bad_backends:
+            raise ValueError(
+                "Decode context parallelism (--dcp-size > 1) for non-MLA "
+                "(GQA/MHA) models is implemented by the triton attention "
+                "backend, and for prefill only by fa3; got attention "
+                f"backend(s) {bad_backends}. Pass --attention-backend triton, "
+                "or --prefill-attention-backend fa3 "
+                "--decode-attention-backend triton."
+            )
+    if is_deepseek_dsa(model_config.hf_config) and (
+        not get_platform().is_cuda
+        or model_config.qk_rope_head_dim != 0
+        or cfg.dsa_prefill_backend not in DSA_DCP_PREFILL_BACKENDS
+        or cfg.dsa_decode_backend != "tilelang"
+        or cfg.dsa_topk_backend == "torch"
+        or not envs.SGLANG_DSA_FUSE_TOPK.get()
+        or cfg.enable_hisparse
+        or (cfg.enable_prefill_cp and not prefill_cp_over_dcp_ranks)
+    ):
+        raise ValueError(
+            "DSA decode context parallelism requires CUDA NoPE MLA, "
+            f"prefill on one of {DSA_DCP_PREFILL_BACKENDS}, decode on tilelang "
+            "(which selects the Triton split-KV decode), and fused top-k; HiSparse cannot be "
+            "combined with it, and prefill CP only as --cp-strategy contiguous "
+            "with --attn-cp-size == --dcp-size == --tp-size and "
+            "--dcp-comm-backend ag_rs."
+        )
 
 
 def handle_data_parallelism(server_args: Any):

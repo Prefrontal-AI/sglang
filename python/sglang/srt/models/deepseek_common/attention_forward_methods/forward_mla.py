@@ -23,6 +23,8 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.dcp.comm import cp_lse_ag_out_ar_mla
+from sglang.srt.layers.dcp.layout import is_dcp_over_attn_cp
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -90,7 +92,7 @@ def _select_local_dcp_heads_for_autotune(
 
 
 def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
-    if not get_parallel().dcp_enabled:
+    if get_attn_backend().dcp_size == 1:
         return False
     return (
         forward_batch.forward_mode.is_decode()
@@ -157,6 +159,8 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
+        if get_parallel().dcp_enabled:
+            return False
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return False
         # Shared activation surface with the DSA indexer graph dispatch
@@ -388,7 +392,7 @@ class DeepseekMLAForwardMixin:
                     # full-head Q from the gathered weight (skips Q all-gather)
                     q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
                         -1,
-                        self.num_local_heads * get_parallel().attn_dcp_size,
+                        self.num_local_heads * get_attn_backend().dcp_size,
                         self.qk_head_dim,
                     )
                 else:
@@ -460,7 +464,7 @@ class DeepseekMLAForwardMixin:
                     hidden_states, self.q_b_proj_qrep_weight
                 ).view(
                     -1,
-                    self.num_local_heads * get_parallel().attn_dcp_size,
+                    self.num_local_heads * get_attn_backend().dcp_size,
                     self.qk_head_dim,
                 )
             else:
@@ -625,14 +629,16 @@ class DeepseekMLAForwardMixin:
         )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if get_parallel().dcp_enabled:
+        if get_attn_backend().dcp_size > 1:
             if is_dcp_mla_decode_phase(forward_batch):
-                if not q_replicate_active:
+                if not q_replicate_active and not (
+                    is_dcp_over_attn_cp() and not self.decode_heads_split
+                ):
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
                     )
-            elif forward_batch.forward_mode.is_extend():
+            elif forward_batch.forward_mode.is_extend() and not self.use_dsa:
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(
                     get_token_to_kv_pool(),
@@ -645,7 +651,7 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     k_pe,
                 )
-            else:
+            elif not self.use_dsa:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
                 )
@@ -768,10 +774,31 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if (
+            is_dcp_mla_decode_phase(forward_batch)
+            and is_dcp_over_attn_cp()
+            and not self.decode_heads_split
+        ):
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+            if not get_in_autotune_dummy_run():
+                if get_parallel().dcp_comm_backend != "ag_rs":
+                    raise NotImplementedError(
+                        "DCP over attention CP supports only the ag_rs backend, got "
+                        f"{get_parallel().dcp_comm_backend!r}; set "
+                        "--dcp-comm-backend ag_rs"
+                    )
+                attn_output = cp_lse_ag_out_ar_mla(
+                    attn_output,
+                    lse,
+                    get_parallel().dcp_group,
+                    is_lse_base_on_e=is_mla_dcp_lse_base_on_e(
+                        self.current_attention_backend
+                    ),
+                ).transpose(0, 1)
+        elif is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads * get_attn_backend().dcp_size,
                 self.kv_lora_rank,
             )
             if get_in_autotune_dummy_run():

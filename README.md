@@ -1,3 +1,8 @@
+> **This is a fork of SGLang for serving Latent Sparse Attention (LSA).**
+> What changed, how to build the image and how to compare with upstream: [FORK.md](FORK.md).
+> The LSA indexer itself is an SGLang plugin in [Prefrontal-AI/latent-sparse-attention](https://github.com/Prefrontal-AI/latent-sparse-attention).
+> The upstream README follows, unchanged.
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 

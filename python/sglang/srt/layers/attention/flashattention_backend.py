@@ -22,12 +22,17 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashattention_dcp import forward_extend_dcp
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.base import (
+    ContextParallelStrategyKind,
+    CPAttentionBackendKind,
+    get_cp_strategy,
+)
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv_index_translator import KVReadTables
@@ -125,6 +130,14 @@ class FlashAttentionMetadata:
 
     local_attn_metadata: Optional[LocalAttentionMetadata] = None
 
+    # Decode context parallel (GQA/MHA) extend: this rank's shard of the prefix
+    # KV (owner rule pos % dcp_size == dcp_rank), as a page-size-1 table of
+    # rank-local slots, and its per-request lengths. Built once per forward by
+    # the first full-attention layer (see forward_extend_dcp).
+    dcp_prefix_page_table: Optional[torch.Tensor] = None
+    dcp_prefix_lens_int32: Optional[torch.Tensor] = None
+    dcp_has_prefix: Optional[bool] = None
+
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
@@ -201,6 +214,12 @@ class FlashAttentionBackend(AttentionBackend):
         # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        if not self.use_mla:
+            # GQA/MHA decode context parallel: the KV pool on each DCP rank holds
+            # only the tokens it owns (pos % dcp_size == dcp_rank) at slot
+            # loc // dcp_size. Only the extend path implements it (see
+            # forward_extend_dcp); decode must run on the triton backend.
+            self._init_dcp(model_runner.is_draft_worker)
         self.kv_index_translator = model_runner.kv_index_translator
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size
@@ -1325,6 +1344,22 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
+        if self.dcp_size > 1:
+            return forward_extend_dcp(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                sinks=sinks,
+                score_mod=score_mod,
+                rel_bias=rel_bias,
+                q_rope=q_rope,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
         cp_active = is_cp_active(forward_batch)
 
         if k is not None:
@@ -1697,6 +1732,42 @@ class FlashAttentionBackend(AttentionBackend):
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
+                elif cp_active and forward_batch.mha_one_shot:
+                    # Contiguous-CP MHA one-shot: rank-local queries against
+                    # this rank's materialized causal window (K/V rows match
+                    # cu_seqlens_kv_prev exactly; causal=True bottom-right
+                    # aligns each query block to its window's end). The
+                    # metadata cu_seqlens are batch-global under CP, so the
+                    # geometry comes from the strategy metadata instead.
+                    cp_strategy = get_cp_strategy()
+                    assert (
+                        cp_strategy is not None
+                        and cp_strategy.kind == ContextParallelStrategyKind.CONTIGUOUS
+                    ), "MHA one-shot under CP requires the contiguous strategy"
+                    meta_cp = forward_batch.attn_cp_metadata
+                    n_logical = meta_cp.total_q_prev_tokens
+                    q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                    pad_size = q_all.shape[0] - n_logical
+                    assert pad_size >= 0
+                    output = flash_attn_varlen_func(
+                        q=q_all[:n_logical],
+                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                        cu_seqlens_q=meta_cp.cu_seqlens_q_prev_tensor,
+                        cu_seqlens_k=meta_cp.cu_seqlens_kv_prev_tensor,
+                        max_seqlen_q=meta_cp.max_seqlen_q_prev,
+                        max_seqlen_k=max(meta_cp.kv_len_prev_list),
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        return_softmax_lse=forward_batch.mha_return_lse,
+                        ver=self.fa_impl_ver,
+                        **kwargs,
+                    )
+                    if pad_size > 0:
+                        output = torch.cat(
+                            [output, output.new_zeros(pad_size, *output.shape[1:])],
+                            dim=0,
+                        )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
                     cu_seqlens_k = (
@@ -1886,6 +1957,11 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
+        if self.dcp_size > 1:
+            raise NotImplementedError(
+                "FA3 implements decode context parallelism for extend only; "
+                "pass --decode-attention-backend triton with --dcp-size > 1"
+            )
         if k is not None:
             assert v is not None
             if save_kv_cache:

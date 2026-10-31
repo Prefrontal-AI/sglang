@@ -1,5 +1,5 @@
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -62,6 +62,42 @@ def test_qsa_allocations_follow_parent_mooncake_scope(monkeypatch):
     )
 
     assert allocations == 4
+
+
+def test_qsa_compressed_index_spans_every_dcp_rank_slot(monkeypatch):
+    def init_parent(pool, **_):
+        pool.full_kv_pool = SimpleNamespace(
+            memory_saver_adapter=SimpleNamespace(region=lambda _: nullcontext()),
+            enable_custom_mem_pool=False,
+        )
+
+    monkeypatch.setattr(HybridLinearKVPool, "__init__", init_parent)
+    monkeypatch.setattr(QSATokenToKVPool, "get_kv_size_bytes", lambda _: (0, 0))
+    pools = {
+        scale: QSATokenToKVPool(
+            size=8,
+            dtype=torch.bfloat16,
+            page_size=4,
+            head_num=1,
+            head_dim=8,
+            full_attention_layer_ids=[1, 3],
+            device="cpu",
+            mamba_pool=object(),
+            qsa_index_kv_heads=1,
+            qsa_index_head_dim=8,
+            qsa_compress_ratio=2,
+            qsa_token_topk=4,
+            num_request_slots=3,
+            slot_space_scale=scale,
+        )
+        for scale in (1, 4)
+    }
+
+    # Slots run over every rank's rows, so the replicated index is four times as long
+    assert pools[1].qsa_compressed_capacity == (8 + 4) // 2
+    assert pools[4].qsa_compressed_capacity == (8 + 4) * 4 // 2
+    assert pools[4].qsa_compressed_page_size == pools[1].qsa_compressed_page_size
+    assert pools[4].qsa_compressed_k_buffer_pool[0].shape[0] == (8 + 4) * 4 // 2
 
 
 if __name__ == "__main__":

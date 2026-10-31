@@ -124,7 +124,11 @@ if HAS_TILELANG:
         block_q: int = 32,
         num_stages: int = 3,
         threads: int = 512,
+        keys_per_cta: int = 2048,
     ):
+        # Long prefixes leave few query rows per launch under the logits budget,
+        # so the keys are split across a second grid axis to fill the GPU.
+        # Each score is complete within one CTA, so the split does not change it.
         rows = T.dynamic("rows")
         keys = T.dynamic("keys")
 
@@ -136,7 +140,11 @@ if HAS_TILELANG:
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
         ):
-            with T.Kernel(T.ceildiv(rows, block_q), threads=threads) as bx:
+            with T.Kernel(
+                T.ceildiv(rows, block_q),
+                T.ceildiv(keys, keys_per_cta),
+                threads=threads,
+            ) as (bx, by):
                 q_shared = T.alloc_shared([block_q * heads, head_dim], T.bfloat16)
                 k_shared = T.alloc_shared([block_n, head_dim], T.bfloat16)
                 scores = T.alloc_fragment([block_n, block_q * heads], T.float32)
@@ -150,12 +158,15 @@ if HAS_TILELANG:
                 for qi in T.serial(block_q):
                     start_min = T.min(start_min, T.min(Starts[row_base + qi], keys))
                     end_max = T.max(end_max, T.min(Ends[row_base + qi], keys))
+                key_lo = T.max(start_min, by * keys_per_cta)
+                key_hi = T.min(end_max, (by + 1) * keys_per_cta)
 
                 T.copy(Q[row_base * heads, 0], q_shared)
                 for ni in T.Pipelined(
-                    T.ceildiv(end_max - start_min, block_n), num_stages=num_stages
+                    T.ceildiv(T.max(key_hi - key_lo, 0), block_n),
+                    num_stages=num_stages,
                 ):
-                    T.copy(K[start_min + ni * block_n, 0], k_shared)
+                    T.copy(K[key_lo + ni * block_n, 0], k_shared)
                     T.gemm(
                         k_shared,
                         q_shared,
@@ -168,9 +179,11 @@ if HAS_TILELANG:
                         scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
                     T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
                     for qi, n in T.Parallel(block_q, block_n):
-                        Logits[row_base + qi, start_min + ni * block_n + n] = reduced[
-                            n, qi
-                        ]
+                        # The last tile can run past this CTA's keys into the next CTA's
+                        if key_lo + ni * block_n + n < key_hi:
+                            Logits[row_base + qi, key_lo + ni * block_n + n] = reduced[
+                                n, qi
+                            ]
 
         return kernel
 

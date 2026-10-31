@@ -23,7 +23,13 @@ def prepare_chunk_indices(
             for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
         ]
     )
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+    indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
+    if cu_seqlens.is_cuda:
+        # pinned + non_blocking: an async H2D copy instead of a blocking one
+        return indices.pin_memory().to(
+            device=cu_seqlens.device, dtype=cu_seqlens.dtype, non_blocking=True
+        )
+    return indices.to(cu_seqlens)
 
 
 @tensor_cache
@@ -31,5 +37,5 @@ def prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
     return torch.cat(
-        [cu_seqlens.new_tensor([0]), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]
+        [cu_seqlens.new_zeros(1), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]
     ).cumsum(-1)

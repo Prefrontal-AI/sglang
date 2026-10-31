@@ -2682,6 +2682,19 @@ def initialize_model_parallel(
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
+        # Eager prefill gathers on this group go through torch.distributed, whose
+        # NCCL communicator is built on first use with buffers outside torch's
+        # allocator; built late, once the KV pool and cache hold the GPU, that
+        # allocation fails as an NCCL "unhandled cuda error". Build it now.
+        if torch.cuda.is_available() and backend == "nccl":
+            warm = torch.zeros(
+                decode_context_parallel_size,
+                device=f"cuda:{torch.cuda.current_device()}",
+            )
+            torch.distributed.all_reduce(warm, group=_DCP.device_group)
+            torch.distributed.all_gather_into_tensor(
+                warm, torch.zeros_like(warm[:1]), group=_DCP.device_group
+            )
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size

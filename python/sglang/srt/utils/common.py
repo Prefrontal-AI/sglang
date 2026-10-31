@@ -4055,9 +4055,23 @@ def get_cuda_graph_batch_size_alignment() -> int:
         alignment *= 2
     if require_gathered_buffer():
         alignment *= get_parallel().attn_tp_size
-    if alignment % get_parallel().attn_cp_size != 0:
+    if alignment % get_parallel().attn_cp_size != 0 and _decode_scatters_across_cp():
         alignment *= get_parallel().attn_cp_size
     return alignment
+
+
+def _decode_scatters_across_cp() -> bool:
+    # DSA prefill CP decodes replicated tokens at attention TP 1 unless the MoE
+    # scatters them; padding those to the CP size sends the padded rows through
+    # every per-token kernel for nothing.
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+    from sglang.srt.layers.communicator import ScatterMode, sparse_mlp_scatter_mode
+
+    return not (
+        is_dsa_enable_prefill_cp()
+        and get_parallel().attn_tp_size == 1
+        and sparse_mlp_scatter_mode() != ScatterMode.SCATTERED
+    )
 
 
 def get_cuda_graph_max_batch_size(max_batch_size: int) -> int:

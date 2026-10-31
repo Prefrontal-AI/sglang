@@ -22,10 +22,16 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.runtime_context import get_parallel
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
-_QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+# Each tile is a few launches, so a small cap makes a long prefix launch-bound:
+# at 2M tokens 128 MB is 64 rows a tile and 10.6 s per 32k chunk, 512 MB is 3.1 s.
+# At 10M under tp 8 dcp 8, 512 MB is about 51 rows a tile and 12.1 s per chunk;
+# 2 GiB is 8.4 s, and a cold 10.7M prefill drops from 25.9 to 21.0 min with
+# peak memory 130.3 of 143.8 GB a card under expandable segments.
+_QSA_PREFILL_LOGITS_BUDGET_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
@@ -478,6 +484,49 @@ class QSAIndexer(MultiPlatformOp):
             del logits, block_indices, selected
         return output
 
+    def select_prefill_tokens_over_ranks(
+        self,
+        dcp_size: int,
+        q: torch.Tensor,
+        compressed_keys: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        query_positions: torch.Tensor,
+        sequence_lengths_for_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select a share of the rows on each decode context parallel rank and gather every share.
+
+        A row's selection reads only that row, and every rank holds the whole index,
+        so each rank ends with the selection one rank would make alone.
+
+        Args:
+            dcp_size: Decode context parallel ranks the rows are shared over.
+            q: Index queries [rows, index_heads, index_head_dim].
+            compressed_keys: Every sequence's compressed index keys, packed.
+            row_starts: Each row's first compressed key [rows] int32.
+            row_ends: Each row's end of compressed keys [rows] int32.
+            query_positions: Each row's logical position [rows].
+            sequence_lengths_for_rows: Each row's sequence length [rows] int32.
+
+        Returns:
+            Selected logical positions per row [rows, token_topk + compress_ratio - 1] int32.
+        """
+        rows = q.shape[0]
+        share = -(rows // -dcp_size)
+        start = min(get_parallel().attn_dcp_rank * share, rows)
+        end = min(start + share, rows)
+        selected = self.select_prefill_tokens(
+            q[start:end],
+            compressed_keys,
+            row_starts[start:end],
+            row_ends[start:end],
+            query_positions[start:end],
+            sequence_lengths_for_rows[start:end],
+        )
+        padded = selected.new_full((share, selected.shape[1]), -1)
+        padded[: end - start].copy_(selected)
+        return get_parallel().dcp_group.all_gather(padded, dim=0)[:rows]
+
     def select_decode_tokens(
         self,
         q: torch.Tensor,
@@ -622,6 +671,19 @@ class QSAIndexer(MultiPlatformOp):
         row_sequence_lengths = sequence_lengths.index_select(
             0, query_sequence_ids.long()
         )
+        dcp_size = int(
+            getattr(indexer_metadata.token_to_kv_pool, "qsa_slot_space_scale", 1)
+        )
+        if dcp_size > 1:
+            return self.select_prefill_tokens_over_ranks(
+                dcp_size,
+                q,
+                compressed_keys,
+                row_starts,
+                row_ends,
+                logical_positions,
+                row_sequence_lengths,
+            )
         return self.select_prefill_tokens(
             q,
             compressed_keys,
